@@ -4,27 +4,8 @@
 
 const { chromium } = require('playwright');
 const fs = require('fs');
-const path = require('path');
 
 const COPYTEXT_URL = 'https://copytext.app';
-
-// Paths to existing Chromium browsers on Render
-const CHROME_PATHS = [
-  '/usr/bin/google-chrome',
-  '/usr/bin/chromium',
-  '/usr/bin/chromium-browser',
-  process.env.PLAYWRIGHT_CHROME_PATH || null,
-].filter(Boolean);
-
-function findExistingBrowser() {
-  for (const p of CHROME_PATHS) {
-    if (p && fs.existsSync(p)) {
-      console.log(`✅ Found browser at: ${p}`);
-      return p;
-    }
-  }
-  return null;
-}
 
 /**
  * Get caption from copytext.app using Playwright
@@ -36,27 +17,22 @@ async function getCaptionFromCopytext(reelUrl) {
   let caption = '';
   
   try {
-    // Try to find existing browser
-    let browserPath = findExistingBrowser();
+    console.log('🚀 Launching browser on Render...');
     
-    // On Render, Playwright will handle browser installation automatically
-    // if we don't specify a path
+    // 🔥 FIX: Use Playwright's default browser with proper args for Render
     const launchOptions = { 
-      headless: true,  // Headless mode for server
+      headless: true,
       args: [
         '--no-sandbox',
         '--disable-setuid-sandbox',
         '--disable-dev-shm-usage',
         '--disable-accelerated-2d-canvas',
-        '--disable-gpu'
+        '--disable-gpu',
+        '--disable-web-security',
+        '--disable-features=site-per-process'
       ]
     };
     
-    if (browserPath) {
-      launchOptions.executablePath = browserPath;
-    }
-    
-    console.log('🚀 Launching browser...');
     browser = await chromium.launch(launchOptions);
     
     const context = await browser.newContext({
@@ -72,7 +48,7 @@ async function getCaptionFromCopytext(reelUrl) {
       timeout: 30000 
     });
     
-    await page.waitForTimeout(2000);
+    await page.waitForTimeout(3000);
     
     console.log('📝 Pasting URL...');
     const textbox = page.getByRole('textbox', { name: 'Paste an Instagram link…' });
@@ -87,14 +63,14 @@ async function getCaptionFromCopytext(reelUrl) {
     await getTextButton.click();
     
     console.log('⏳ Waiting for caption...');
-    await page.waitForTimeout(3000);
+    await page.waitForTimeout(5000);
     
     console.log('📋 Clicking "Copy"...');
     const copyButton = page.getByRole('button', { name: 'Copy' });
     await copyButton.waitFor({ state: 'visible', timeout: 10000 });
     await copyButton.click();
     
-    await page.waitForTimeout(1000);
+    await page.waitForTimeout(2000);
     
     // Get the caption
     console.log('📝 Extracting caption...');
