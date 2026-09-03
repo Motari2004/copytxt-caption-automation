@@ -2,10 +2,35 @@
  * Copytext scraper using Playwright
  */
 
+require('dotenv').config();
+
 const { chromium } = require('playwright');
 const fs = require('fs');
+const path = require('path');
 
 const COPYTEXT_URL = 'https://copytext.app';
+
+function getBrowserPath() {
+  if (process.env.PLAYWRIGHT_CHROME_PATH) {
+    return process.env.PLAYWRIGHT_CHROME_PATH;
+  }
+  
+  const commonPaths = [
+    '/usr/bin/google-chrome',
+    '/usr/bin/chromium-browser',
+    '/usr/bin/chromium',
+    path.join(process.env.PLAYWRIGHT_BROWSERS_PATH || '', 'chromium-1200/chrome-win64/chrome.exe'),
+    path.join(process.env.PLAYWRIGHT_BROWSERS_PATH || '', 'chromium-1234/chrome-win64/chrome.exe'),
+  ];
+  
+  for (const p of commonPaths) {
+    if (fs.existsSync(p)) {
+      return p;
+    }
+  }
+  
+  return null;
+}
 
 /**
  * Get caption from copytext.app using Playwright
@@ -17,9 +42,11 @@ async function getCaptionFromCopytext(reelUrl) {
   let caption = '';
   
   try {
-    console.log('🚀 Launching browser on Render...');
+    const browserPath = getBrowserPath();
+    if (browserPath) {
+      console.log(`✅ Found browser at: ${browserPath}`);
+    }
     
-    // 🔥 FIX: Use Playwright's default browser with proper args for Render
     const launchOptions = { 
       headless: true,
       args: [
@@ -27,12 +54,15 @@ async function getCaptionFromCopytext(reelUrl) {
         '--disable-setuid-sandbox',
         '--disable-dev-shm-usage',
         '--disable-accelerated-2d-canvas',
-        '--disable-gpu',
-        '--disable-web-security',
-        '--disable-features=site-per-process'
+        '--disable-gpu'
       ]
     };
     
+    if (browserPath) {
+      launchOptions.executablePath = browserPath;
+    }
+    
+    console.log('🚀 Launching browser...');
     browser = await chromium.launch(launchOptions);
     
     const context = await browser.newContext({
@@ -72,90 +102,142 @@ async function getCaptionFromCopytext(reelUrl) {
     
     await page.waitForTimeout(2000);
     
-    // Get the caption
-    console.log('📝 Extracting caption...');
+    // 🔥 NEW: Use the exact selector for the caption textbox
+    console.log('📝 Extracting caption using exact selector...');
     
-    // Try to get from result area
     try {
-      const resultText = await page.evaluate(() => {
-        const elements = document.querySelectorAll('div, p, span, section');
-        let foundCaption = '';
-        
-        for (const el of elements) {
-          const text = el.textContent || '';
-          if (text.includes('Extracted caption') || text.includes('提取的文案')) {
-            const parent = el.parentElement;
-            if (parent) {
-              let cleanText = parent.textContent || '';
-              cleanText = cleanText.replace(/Extracted caption|提取的文案/g, '').trim();
-              cleanText = cleanText.replace(/Edit|Copy|📋|✏️/g, '').trim();
-              if (cleanText.length > 10) {
-                return cleanText;
-              }
-            }
-          }
-        }
-        
-        for (const el of elements) {
-          const text = el.textContent || '';
-          if (text.length > 20 && 
-              !text.includes('Paste an Instagram link') &&
-              !text.includes('Get text') &&
-              !text.includes('copytext') &&
-              !text.includes('Cookie') &&
-              !text.includes('Language') &&
-              !text.includes('History') &&
-              !text.includes('Sync') &&
-              !text.includes('Sign in') &&
-              !text.includes('Edit') &&
-              !text.includes('Copy') &&
-              !text.includes('提取') &&
-              text.length > 15) {
-            return text.trim();
-          }
-        }
-        
-        return '';
-      });
+      // Wait for the success state to appear
+      await page.waitForSelector('#successState', { timeout: 10000 });
       
-      if (resultText) {
-        caption = resultText;
-        console.log('✅ Found caption in result area');
+      // 🔥 Get the caption from the textbox inside #successState
+      const captionTextBox = page.locator('#successState').getByRole('textbox');
+      await captionTextBox.waitFor({ state: 'visible', timeout: 5000 });
+      
+      // Get the text content
+      caption = await captionTextBox.textContent();
+      
+      if (caption && caption.trim().length > 10) {
+        caption = caption.trim();
+        console.log(`✅ Found caption in #successState textbox: ${caption.substring(0, 50)}...`);
+      } else {
+        // Try to get the value instead of textContent
+        caption = await captionTextBox.inputValue();
+        if (caption && caption.trim().length > 10) {
+          caption = caption.trim();
+          console.log(`✅ Found caption via inputValue: ${caption.substring(0, 50)}...`);
+        }
       }
-    } catch (e) {}
+    } catch (e) {
+      console.log('⚠️ Could not find #successState textbox, trying fallback...');
+    }
     
-    // Try clipboard
-    if (!caption || caption.length < 10) {
+    // Fallback: Use clipboard
+    if (!caption || caption.length < 20) {
       try {
         const clipboardText = await page.evaluate(() => {
           return navigator.clipboard.readText().catch(() => '');
         });
         
-        if (clipboardText && clipboardText.length > 10) {
+        if (clipboardText && clipboardText.length > 20) {
           caption = clipboardText;
-          console.log('✅ Found caption via clipboard');
+          console.log('✅ Found caption via clipboard (fallback)');
+        }
+      } catch (e) {}
+    }
+    
+    // Fallback: Use result area
+    if (!caption || caption.length < 20) {
+      try {
+        const resultText = await page.evaluate(() => {
+          const elements = document.querySelectorAll('div, p, span');
+          let foundCaption = '';
+          
+          for (const el of elements) {
+            const text = el.textContent || '';
+            if (text.includes('Extracted caption') || text.includes('提取的文案')) {
+              const parent = el.parentElement;
+              if (parent) {
+                let cleanText = parent.textContent || '';
+                cleanText = cleanText.replace(/Extracted caption|提取的文案/g, '').trim();
+                cleanText = cleanText.replace(/Edit|Copy|📋|✏️/g, '').trim();
+                if (cleanText.length > 20) {
+                  return cleanText;
+                }
+              }
+            }
+          }
+          
+          // Look for large text blocks
+          for (const el of elements) {
+            const text = el.textContent || '';
+            if (text.length > 50 && 
+                !text.includes('Paste an Instagram link') &&
+                !text.includes('Get text') &&
+                !text.includes('copytext') &&
+                !text.includes('Cookie') &&
+                !text.includes('Language') &&
+                !text.includes('History') &&
+                !text.includes('Sync') &&
+                !text.includes('Edit') &&
+                !text.includes('Copy') &&
+                !text.includes('Developed by') &&
+                !text.includes('Wisenheimer') &&
+                text.length > 30) {
+              return text.trim();
+            }
+          }
+          
+          return '';
+        });
+        
+        if (resultText) {
+          caption = resultText;
+          console.log('✅ Found caption via result area (fallback)');
         }
       } catch (e) {}
     }
     
     // Clean up
     if (caption) {
-      const removeTexts = [
-        'Edit', 'Copy', '📋', '✏️', 'Get text', 'Extract', 
-        'Extracted caption', '提取的文案', '点按以编辑', '编辑',
-        'Advertisement', '广告', '复制', '编辑'
+      // Remove common UI text
+      const removePatterns = [
+        /copytext\s*Developed by Wisenheimer/gi,
+        /Paste an Instagram link[^\n]*/gi,
+        /Get text/gi,
+        /Copy/gi,
+        /Edit/gi,
+        /TAP TO EDIT/gi,
+        /SAVE/gi,
+        /history/gi,
+        /Sync your history[^\n]*/gi,
+        /Sign in with Google[^\n]*/gi,
+        /Remove ads/gi,
+        /Sign out/gi,
+        /Not now/gi,
+        /Transfer/gi,
+        /Language[\s\S]*?English/gi,
+        /We use cookies for ads[^\n]*/gi,
+        /Accept/gi,
+        /Decline/gi,
+        /Try again/gi,
+        /Advertisement/gi,
+        /©.*$/gi
       ];
-      for (const text of removeTexts) {
-        caption = caption.replace(new RegExp(text, 'g'), '');
+      
+      for (const pattern of removePatterns) {
+        caption = caption.replace(pattern, '');
       }
-      caption = caption.trim();
+      
+      caption = caption.replace(/\s+/g, ' ').trim();
     }
     
     await browser.close();
     
+    console.log(`📊 Final caption length: ${caption ? caption.length : 0} characters`);
+    
     return {
       caption: caption || '',
-      success: caption && caption.length > 5,
+      success: caption && caption.length > 20,
       url: reelUrl
     };
     
