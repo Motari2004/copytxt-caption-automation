@@ -7,6 +7,7 @@ const express = require('express');
 const cors = require('cors');
 const { Pool } = require('pg');
 const { getCaptionFromCopytext, processBatch } = require('./scraper');
+const axios = require('axios');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -19,7 +20,6 @@ const pool = new Pool({
 });
 
 // ============== AUTO CREATE TABLES ==============
-// 🔥 This runs automatically when the server starts
 
 async function initDatabase() {
     try {
@@ -138,6 +138,24 @@ async function getCaptionsByUsername(username, limit = 50) {
     }
 }
 
+// ============== WEBHOOK HELPER ==============
+
+async function sendWebhook(webhook_url, payload) {
+    if (!webhook_url) return;
+    
+    try {
+        console.log(`📤 Sending webhook to: ${webhook_url}`);
+        await axios.post(webhook_url, payload, {
+            timeout: 10000,
+            headers: { 'Content-Type': 'application/json' }
+        });
+        console.log(`✅ Webhook sent successfully`);
+    } catch (error) {
+        console.error(`❌ Failed to send webhook: ${error.message}`);
+        // Don't fail the main request if webhook fails
+    }
+}
+
 // ============== MIDDLEWARE ==============
 
 app.use(cors());
@@ -171,12 +189,26 @@ app.get('/api/health', async (req, res) => {
 });
 
 /**
- * Get caption for a single URL
+ * Get caption for a single URL with webhook support
  * POST /api/caption
- * Body: { "url": "https://www.instagram.com/...", "username": "optional" }
+ * Body: { 
+ *   "url": "https://www.instagram.com/...", 
+ *   "username": "optional",
+ *   "job_id": "optional",
+ *   "webhook_url": "optional",
+ *   "pipeline_id": "optional",
+ *   "profile_username": "optional"
+ * }
  */
 app.post('/api/caption', async (req, res) => {
-    const { url, username } = req.body;
+    const { 
+        url, 
+        username, 
+        job_id, 
+        webhook_url, 
+        pipeline_id, 
+        profile_username 
+    } = req.body;
     
     if (!url) {
         return res.status(400).json({ 
@@ -190,6 +222,22 @@ app.post('/api/caption', async (req, res) => {
         const dbResult = await getCaptionFromDB(url);
         
         if (dbResult && dbResult.caption) {
+            console.log(`📦 Found caption in database for: ${url.substring(0, 50)}...`);
+            
+            // 🔥 Send webhook callback if provided
+            if (webhook_url) {
+                await sendWebhook(webhook_url, {
+                    reel_url: url,
+                    caption: dbResult.caption,
+                    job_id: job_id,
+                    status: 'completed',
+                    profile_username: profile_username || username,
+                    pipeline_id: pipeline_id,
+                    source: 'database',
+                    timestamp: new Date().toISOString()
+                });
+            }
+            
             return res.json({
                 success: true,
                 url: url,
@@ -207,6 +255,20 @@ app.post('/api/caption', async (req, res) => {
             // Store in database
             await storeCaption(url, result.caption, username);
             
+            // 🔥 Send webhook callback if provided
+            if (webhook_url) {
+                await sendWebhook(webhook_url, {
+                    reel_url: url,
+                    caption: result.caption,
+                    job_id: job_id,
+                    status: 'completed',
+                    profile_username: profile_username || username,
+                    pipeline_id: pipeline_id,
+                    source: 'scraped',
+                    timestamp: new Date().toISOString()
+                });
+            }
+            
             res.json({
                 success: true,
                 url: result.url,
@@ -216,6 +278,20 @@ app.post('/api/caption', async (req, res) => {
                 timestamp: new Date().toISOString()
             });
         } else {
+            // 🔥 Send failure webhook
+            if (webhook_url) {
+                await sendWebhook(webhook_url, {
+                    reel_url: url,
+                    caption: null,
+                    job_id: job_id,
+                    status: 'failed',
+                    error: result.error || 'No caption found',
+                    profile_username: profile_username || username,
+                    pipeline_id: pipeline_id,
+                    timestamp: new Date().toISOString()
+                });
+            }
+            
             res.status(404).json({
                 success: false,
                 url: result.url,
@@ -225,6 +301,21 @@ app.post('/api/caption', async (req, res) => {
         }
     } catch (error) {
         console.error(`❌ Error: ${error.message}`);
+        
+        // 🔥 Send error webhook
+        if (webhook_url) {
+            await sendWebhook(webhook_url, {
+                reel_url: url,
+                caption: null,
+                job_id: job_id,
+                status: 'failed',
+                error: error.message,
+                profile_username: profile_username || username,
+                pipeline_id: pipeline_id,
+                timestamp: new Date().toISOString()
+            });
+        }
+        
         res.status(500).json({
             success: false,
             error: 'Internal server error',
