@@ -102,29 +102,29 @@ async function getCaptionFromCopytext(reelUrl) {
     
     await page.waitForTimeout(2000);
     
-    // Extract caption using exact selector
+    // 🔥 NEW: Use the exact selector for the caption textbox
     console.log('📝 Extracting caption using exact selector...');
     
     try {
       // Wait for the success state to appear
       await page.waitForSelector('#successState', { timeout: 10000 });
       
-      // Get the caption from the textbox inside #successState
+      // 🔥 Get the caption from the textbox inside #successState
       const captionTextBox = page.locator('#successState').getByRole('textbox');
       await captionTextBox.waitFor({ state: 'visible', timeout: 5000 });
       
-      // Try to get the value
-      caption = await captionTextBox.inputValue();
+      // Get the text content
+      caption = await captionTextBox.textContent();
       
       if (caption && caption.trim().length > 10) {
         caption = caption.trim();
-        console.log(`✅ Found caption via inputValue: ${caption.substring(0, 50)}...`);
+        console.log(`✅ Found caption in #successState textbox: ${caption.substring(0, 50)}...`);
       } else {
-        // Try textContent
-        caption = await captionTextBox.textContent();
+        // Try to get the value instead of textContent
+        caption = await captionTextBox.inputValue();
         if (caption && caption.trim().length > 10) {
           caption = caption.trim();
-          console.log(`✅ Found caption via textContent: ${caption.substring(0, 50)}...`);
+          console.log(`✅ Found caption via inputValue: ${caption.substring(0, 50)}...`);
         }
       }
     } catch (e) {

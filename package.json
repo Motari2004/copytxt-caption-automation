@@ -1,7 +1,7 @@
 {
   "name": "copytxt-caption-automation",
   "version": "1.0.0",
-  "description": "Automate copytext.app to get Instagram captions",
+  "description": "Automate copytext.app to get Instagram captions with database storage",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
@@ -13,7 +13,8 @@
     "playwright": "^1.40.0",
     "axios": "^1.6.2",
     "cors": "^2.8.5",
-    "dotenv": "^16.3.1"
+    "dotenv": "^16.3.1",
+    "pg": "^8.11.3"
   },
   "devDependencies": {
     "nodemon": "^3.0.1"
