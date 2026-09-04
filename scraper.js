@@ -12,18 +12,27 @@ const axios = require('axios');
 const COPYTEXT_URL = 'https://copytext.app';
 
 // ============== BROWSER POOL ==============
-// 🔥 Shared browser instance reused across requests
 
 let sharedBrowser = null;
 let browserRefCount = 0;
 let browserLock = false;
 let pendingRequests = [];
+let browserCloseTimeout = null;
+const BROWSER_IDLE_TIMEOUT = 300000; // 🔥 5 minutes instead of 60 seconds
 
 async function getBrowser() {
     // If browser exists and is connected, use it
     if (sharedBrowser && sharedBrowser.isConnected()) {
         browserRefCount++;
         console.log(`🔄 Reusing browser (ref count: ${browserRefCount})`);
+        
+        // ✅ Cancel any pending close timeout
+        if (browserCloseTimeout) {
+            clearTimeout(browserCloseTimeout);
+            browserCloseTimeout = null;
+            console.log('⏰ Cancelled browser close (still in use)');
+        }
+        
         return sharedBrowser;
     }
     
@@ -81,21 +90,45 @@ function releaseBrowser() {
     browserRefCount--;
     console.log(`🔽 Releasing browser (ref count: ${browserRefCount})`);
     
-    // Schedule browser close after 60 seconds of inactivity
+    // ✅ Clear any existing timeout
+    if (browserCloseTimeout) {
+        clearTimeout(browserCloseTimeout);
+        browserCloseTimeout = null;
+    }
+    
+    // Schedule browser close after idle timeout
     if (browserRefCount <= 0 && sharedBrowser) {
-        console.log('⏳ Scheduling browser close in 60 seconds...');
-        setTimeout(async () => {
+        console.log(`⏳ Scheduling browser close in ${BROWSER_IDLE_TIMEOUT/1000} seconds...`);
+        browserCloseTimeout = setTimeout(async () => {
             if (browserRefCount <= 0 && sharedBrowser && sharedBrowser.isConnected()) {
                 try {
                     await sharedBrowser.close();
                     sharedBrowser = null;
+                    browserCloseTimeout = null;
                     console.log('🔒 Browser closed (idle timeout)');
                 } catch (e) {
                     console.log('⚠️ Browser already closed');
                     sharedBrowser = null;
                 }
             }
-        }, 60000); // Close after 60 seconds idle
+        }, BROWSER_IDLE_TIMEOUT);
+    }
+}
+
+// Force close browser (call this on server shutdown)
+async function closeBrowser() {
+    if (browserCloseTimeout) {
+        clearTimeout(browserCloseTimeout);
+        browserCloseTimeout = null;
+    }
+    if (sharedBrowser && sharedBrowser.isConnected()) {
+        try {
+            await sharedBrowser.close();
+            sharedBrowser = null;
+            console.log('🔒 Browser closed (forced)');
+        } catch (e) {
+            console.log('⚠️ Browser already closed');
+        }
     }
 }
 
@@ -143,6 +176,31 @@ async function getCaptionViaOEmbed(reelUrl) {
     }
 }
 
+// ============== MEMORY CACHE ==============
+
+const memoryCache = {};
+const CACHE_TTL = 3600000; // 1 hour
+
+async function getCachedCaption(reelUrl) {
+    if (memoryCache[reelUrl]) {
+        const cacheEntry = memoryCache[reelUrl];
+        if (Date.now() - cacheEntry.timestamp < CACHE_TTL) {
+            console.log(`📦 Using memory cache for: ${reelUrl.substring(0, 50)}...`);
+            return cacheEntry.result;
+        } else {
+            delete memoryCache[reelUrl];
+        }
+    }
+    return null;
+}
+
+function setCachedCaption(reelUrl, result) {
+    memoryCache[reelUrl] = {
+        result: result,
+        timestamp: Date.now()
+    };
+}
+
 // ============== MAIN CAPTION FUNCTION ==============
 
 /**
@@ -151,9 +209,16 @@ async function getCaptionViaOEmbed(reelUrl) {
 async function getCaptionFromCopytext(reelUrl) {
     console.log(`📝 Fetching caption for: ${reelUrl.substring(0, 50)}...`);
     
+    // 🔥 Check memory cache first
+    const cached = await getCachedCaption(reelUrl);
+    if (cached) {
+        return cached;
+    }
+    
     // 🔥 Try oEmbed first (fastest)
     const oembedResult = await getCaptionViaOEmbed(reelUrl);
     if (oembedResult && oembedResult.caption) {
+        setCachedCaption(reelUrl, oembedResult);
         return oembedResult;
     }
     
@@ -325,17 +390,23 @@ async function getCaptionFromCopytext(reelUrl) {
             caption = caption.replace(/\s+/g, ' ').trim();
         }
         
-        await context.close();
+        // Close context (but keep browser open)
+        await context.close().catch(() => {});
         releaseBrowser();
         
         console.log(`📊 Final caption length: ${caption ? caption.length : 0} characters`);
         
-        return {
+        const result = {
             caption: caption || '',
             success: caption && caption.length > 20,
             url: reelUrl,
             method: 'copytext'
         };
+        
+        // Cache the result
+        setCachedCaption(reelUrl, result);
+        
+        return result;
         
     } catch (error) {
         console.error(`❌ Error: ${error.message}`);
@@ -398,10 +469,10 @@ async function processBatch(urls, concurrency = 3) {
             if (result) results.push(result);
         }
         
-        // Wait between chunks
+        // 🔥 Reduced wait time between chunks
         if (i + chunkSize < urls.length) {
-            console.log('⏳ Waiting 2 seconds before next chunk...');
-            await new Promise(resolve => setTimeout(resolve, 2000));
+            console.log('⏳ Waiting 1 second before next chunk...');
+            await new Promise(resolve => setTimeout(resolve, 1000));
         }
     }
     
@@ -411,4 +482,5 @@ async function processBatch(urls, concurrency = 3) {
     return results;
 }
 
-module.exports = { getCaptionFromCopytext, processBatch };
+// Export closeBrowser for graceful shutdown
+module.exports = { getCaptionFromCopytext, processBatch, closeBrowser };
