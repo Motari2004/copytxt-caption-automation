@@ -13,8 +13,8 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 
 // ============== REQUEST DEDUPLICATION ==============
-// Track pending requests to avoid duplicate processing
 const pendingRequests = new Map();
+const pendingWebhooks = new Map(); // Track which webhooks have been sent
 
 // ============== DATABASE CONNECTION ==============
 
@@ -144,6 +144,23 @@ async function getCaptionsByUsername(username, limit = 50) {
 async function sendWebhook(webhook_url, payload) {
     if (!webhook_url) return;
     
+    // Create a unique key for this webhook
+    const webhookKey = `${webhook_url}_${payload.reel_url}`;
+    
+    // Only send if this webhook hasn't been sent yet
+    if (pendingWebhooks.has(webhookKey)) {
+        console.log(`⏭️ Skipping duplicate webhook for ${payload.reel_url.substring(0, 50)}...`);
+        return;
+    }
+    
+    // Mark as sent
+    pendingWebhooks.set(webhookKey, true);
+    
+    // Clean up after 10 seconds
+    setTimeout(() => {
+        pendingWebhooks.delete(webhookKey);
+    }, 10000);
+    
     try {
         console.log(`📤 Sending webhook to: ${webhook_url}`);
         await axios.post(webhook_url, payload, {
@@ -153,6 +170,7 @@ async function sendWebhook(webhook_url, payload) {
         console.log(`✅ Webhook sent successfully`);
     } catch (error) {
         console.error(`❌ Failed to send webhook: ${error.message}`);
+        pendingWebhooks.delete(webhookKey);
     }
 }
 
@@ -175,7 +193,9 @@ app.get('/api/health', async (req, res) => {
             service: 'Copytext Caption Automation',
             version: '1.0.0',
             uptime: process.uptime(),
-            database: 'connected'
+            database: 'connected',
+            pending_requests: pendingRequests.size,
+            pending_webhooks: pendingWebhooks.size
         });
     } catch (err) {
         res.json({
@@ -191,6 +211,14 @@ app.get('/api/health', async (req, res) => {
 /**
  * Get caption for a single URL with deduplication
  * POST /api/caption
+ * Body: { 
+ *   "url": "https://www.instagram.com/...", 
+ *   "username": "optional",
+ *   "job_id": "optional",
+ *   "webhook_url": "optional",
+ *   "pipeline_id": "optional",
+ *   "profile_username": "optional"
+ * }
  */
 app.post('/api/caption', async (req, res) => {
     const { 
@@ -209,34 +237,20 @@ app.post('/api/caption', async (req, res) => {
         });
     }
     
-    // 🔥 DEDUPLICATION: Check if this URL is already being processed
     const pendingKey = url;
     
+    // Check if already pending
     if (pendingRequests.has(pendingKey)) {
         console.log(`⏳ Request for ${url.substring(0, 50)}... already pending, waiting...`);
         
-        // Wait for the existing request to complete
         try {
             const result = await pendingRequests.get(pendingKey);
             console.log(`✅ Got result from pending request for ${url.substring(0, 50)}...`);
             
-            // Send webhook with the result
-            if (webhook_url && result.caption) {
-                await sendWebhook(webhook_url, {
-                    reel_url: url,
-                    caption: result.caption,
-                    job_id: job_id,
-                    status: 'completed',
-                    profile_username: profile_username || username,
-                    pipeline_id: pipeline_id,
-                    source: 'deduplicated',
-                    timestamp: new Date().toISOString()
-                });
-            }
-            
+            // 🔥 Duplicate request - DO NOT send webhook again
             return res.json(result);
         } catch (error) {
-            console.error(`❌ Pending request failed for ${url.substring(0, 50)}...:`, error.message);
+            console.error(`❌ Pending request failed:`, error.message);
             // Continue to process if pending request failed
         }
     }
@@ -377,6 +391,7 @@ app.post('/api/caption', async (req, res) => {
 /**
  * Process multiple URLs
  * POST /api/caption/batch
+ * Body: { "urls": ["url1", "url2", ...] }
  */
 app.post('/api/caption/batch', async (req, res) => {
     const { urls } = req.body;
@@ -415,6 +430,7 @@ app.post('/api/caption/batch', async (req, res) => {
             console.log(`📝 Scraping ${urlsToScrape.length} URLs...`);
             const scrapedResults = await processBatch(urlsToScrape);
             
+            // Store scraped results in database
             for (const result of scrapedResults) {
                 if (result.success && result.caption) {
                     await storeCaption(result.url, result.caption);
@@ -445,7 +461,7 @@ app.post('/api/caption/batch', async (req, res) => {
 
 /**
  * Get caption from Instagram URL via oEmbed (direct method)
- * GET /api/caption?url=...
+ * GET /api/caption?url=https://www.instagram.com/...
  */
 app.get('/api/caption', async (req, res) => {
     const { url } = req.query;
@@ -458,6 +474,7 @@ app.get('/api/caption', async (req, res) => {
     }
     
     try {
+        // Check database first
         const dbResult = await getCaptionFromDB(url);
         
         if (dbResult && dbResult.caption) {
@@ -471,12 +488,12 @@ app.get('/api/caption', async (req, res) => {
             });
         }
         
-        // Try oEmbed first
-        const axios = require('axios');
+        // Try oEmbed first as a faster alternative
         const oembedUrl = `https://api.instagram.com/oembed?url=${encodeURIComponent(url)}`;
         const response = await axios.get(oembedUrl, { timeout: 10000 });
         
         if (response.data && response.data.title) {
+            // Store in database
             await storeCaption(url, response.data.title);
             
             res.json({
@@ -488,6 +505,7 @@ app.get('/api/caption', async (req, res) => {
                 timestamp: new Date().toISOString()
             });
         } else {
+            // Fallback to copytext automation
             const result = await getCaptionFromCopytext(url);
             
             if (result.success) {
@@ -496,6 +514,7 @@ app.get('/api/caption', async (req, res) => {
             res.json(result);
         }
     } catch (error) {
+        // Fallback to copytext automation
         try {
             const result = await getCaptionFromCopytext(url);
             
