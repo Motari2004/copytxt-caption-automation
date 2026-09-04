@@ -12,6 +12,10 @@ const axios = require('axios');
 const app = express();
 const PORT = process.env.PORT || 3000;
 
+// ============== REQUEST DEDUPLICATION ==============
+// Track pending requests to avoid duplicate processing
+const pendingRequests = new Map();
+
 // ============== DATABASE CONNECTION ==============
 
 const pool = new Pool({
@@ -25,7 +29,6 @@ async function initDatabase() {
     try {
         console.log('📦 Initializing database...');
         
-        // Create captions table
         await pool.query(`
             CREATE TABLE IF NOT EXISTS captions (
                 id SERIAL PRIMARY KEY,
@@ -38,7 +41,6 @@ async function initDatabase() {
         `);
         console.log('✅ Table "captions" ready');
 
-        // Create indexes
         await pool.query(`
             CREATE INDEX IF NOT EXISTS idx_captions_url ON captions(url)
         `);
@@ -56,7 +58,6 @@ async function initDatabase() {
     }
 }
 
-// Run database initialization
 initDatabase();
 
 // ============== DATABASE FUNCTIONS ==============
@@ -152,7 +153,6 @@ async function sendWebhook(webhook_url, payload) {
         console.log(`✅ Webhook sent successfully`);
     } catch (error) {
         console.error(`❌ Failed to send webhook: ${error.message}`);
-        // Don't fail the main request if webhook fails
     }
 }
 
@@ -189,16 +189,8 @@ app.get('/api/health', async (req, res) => {
 });
 
 /**
- * Get caption for a single URL with webhook support
+ * Get caption for a single URL with deduplication
  * POST /api/caption
- * Body: { 
- *   "url": "https://www.instagram.com/...", 
- *   "username": "optional",
- *   "job_id": "optional",
- *   "webhook_url": "optional",
- *   "pipeline_id": "optional",
- *   "profile_username": "optional"
- * }
  */
 app.post('/api/caption', async (req, res) => {
     const { 
@@ -217,46 +209,19 @@ app.post('/api/caption', async (req, res) => {
         });
     }
     
-    try {
-        // Check database first
-        const dbResult = await getCaptionFromDB(url);
+    // 🔥 DEDUPLICATION: Check if this URL is already being processed
+    const pendingKey = url;
+    
+    if (pendingRequests.has(pendingKey)) {
+        console.log(`⏳ Request for ${url.substring(0, 50)}... already pending, waiting...`);
         
-        if (dbResult && dbResult.caption) {
-            console.log(`📦 Found caption in database for: ${url.substring(0, 50)}...`);
+        // Wait for the existing request to complete
+        try {
+            const result = await pendingRequests.get(pendingKey);
+            console.log(`✅ Got result from pending request for ${url.substring(0, 50)}...`);
             
-            // 🔥 Send webhook callback if provided
-            if (webhook_url) {
-                await sendWebhook(webhook_url, {
-                    reel_url: url,
-                    caption: dbResult.caption,
-                    job_id: job_id,
-                    status: 'completed',
-                    profile_username: profile_username || username,
-                    pipeline_id: pipeline_id,
-                    source: 'database',
-                    timestamp: new Date().toISOString()
-                });
-            }
-            
-            return res.json({
-                success: true,
-                url: url,
-                caption: dbResult.caption,
-                length: dbResult.caption.length,
-                source: 'database',
-                timestamp: new Date().toISOString()
-            });
-        }
-        
-        console.log(`📝 Processing URL: ${url}`);
-        const result = await getCaptionFromCopytext(url);
-        
-        if (result.success) {
-            // Store in database
-            await storeCaption(url, result.caption, username);
-            
-            // 🔥 Send webhook callback if provided
-            if (webhook_url) {
+            // Send webhook with the result
+            if (webhook_url && result.caption) {
                 await sendWebhook(webhook_url, {
                     reel_url: url,
                     caption: result.caption,
@@ -264,59 +229,144 @@ app.post('/api/caption', async (req, res) => {
                     status: 'completed',
                     profile_username: profile_username || username,
                     pipeline_id: pipeline_id,
-                    source: 'scraped',
+                    source: 'deduplicated',
                     timestamp: new Date().toISOString()
                 });
             }
             
-            res.json({
-                success: true,
-                url: result.url,
-                caption: result.caption,
-                length: result.caption.length,
-                source: 'scraped',
-                timestamp: new Date().toISOString()
-            });
-        } else {
-            // 🔥 Send failure webhook
+            return res.json(result);
+        } catch (error) {
+            console.error(`❌ Pending request failed for ${url.substring(0, 50)}...:`, error.message);
+            // Continue to process if pending request failed
+        }
+    }
+    
+    // Create a promise for this request
+    const requestPromise = (async () => {
+        try {
+            // Check database first
+            const dbResult = await getCaptionFromDB(url);
+            
+            if (dbResult && dbResult.caption) {
+                console.log(`📦 Found caption in database for: ${url.substring(0, 50)}...`);
+                
+                const result = {
+                    success: true,
+                    url: url,
+                    caption: dbResult.caption,
+                    length: dbResult.caption.length,
+                    source: 'database',
+                    timestamp: new Date().toISOString()
+                };
+                
+                // Send webhook callback if provided
+                if (webhook_url) {
+                    await sendWebhook(webhook_url, {
+                        reel_url: url,
+                        caption: dbResult.caption,
+                        job_id: job_id,
+                        status: 'completed',
+                        profile_username: profile_username || username,
+                        pipeline_id: pipeline_id,
+                        source: 'database',
+                        timestamp: new Date().toISOString()
+                    });
+                }
+                
+                return result;
+            }
+            
+            console.log(`📝 Processing URL: ${url}`);
+            const result = await getCaptionFromCopytext(url);
+            
+            if (result.success) {
+                // Store in database
+                await storeCaption(url, result.caption, username);
+                
+                // Send webhook callback if provided
+                if (webhook_url) {
+                    await sendWebhook(webhook_url, {
+                        reel_url: url,
+                        caption: result.caption,
+                        job_id: job_id,
+                        status: 'completed',
+                        profile_username: profile_username || username,
+                        pipeline_id: pipeline_id,
+                        source: 'scraped',
+                        timestamp: new Date().toISOString()
+                    });
+                }
+                
+                return {
+                    success: true,
+                    url: result.url,
+                    caption: result.caption,
+                    length: result.caption.length,
+                    source: 'scraped',
+                    timestamp: new Date().toISOString()
+                };
+            } else {
+                // Send failure webhook
+                if (webhook_url) {
+                    await sendWebhook(webhook_url, {
+                        reel_url: url,
+                        caption: null,
+                        job_id: job_id,
+                        status: 'failed',
+                        error: result.error || 'No caption found',
+                        profile_username: profile_username || username,
+                        pipeline_id: pipeline_id,
+                        timestamp: new Date().toISOString()
+                    });
+                }
+                
+                return {
+                    success: false,
+                    url: result.url,
+                    error: 'Could not extract caption',
+                    message: result.error || 'No caption found'
+                };
+            }
+        } catch (error) {
+            console.error(`❌ Error processing ${url}:`, error.message);
+            
+            // Send error webhook
             if (webhook_url) {
                 await sendWebhook(webhook_url, {
                     reel_url: url,
                     caption: null,
                     job_id: job_id,
                     status: 'failed',
-                    error: result.error || 'No caption found',
+                    error: error.message,
                     profile_username: profile_username || username,
                     pipeline_id: pipeline_id,
                     timestamp: new Date().toISOString()
                 });
             }
             
-            res.status(404).json({
-                success: false,
-                url: result.url,
-                error: 'Could not extract caption',
-                message: result.error || 'No caption found'
-            });
+            throw error;
+        }
+    })();
+    
+    // Store the pending request
+    pendingRequests.set(pendingKey, requestPromise);
+    
+    // Clean up after completion
+    requestPromise.finally(() => {
+        pendingRequests.delete(pendingKey);
+        console.log(`🧹 Cleaned up pending request for ${url.substring(0, 50)}...`);
+    });
+    
+    try {
+        const result = await requestPromise;
+        
+        if (result.success) {
+            return res.json(result);
+        } else {
+            return res.status(404).json(result);
         }
     } catch (error) {
-        console.error(`❌ Error: ${error.message}`);
-        
-        // 🔥 Send error webhook
-        if (webhook_url) {
-            await sendWebhook(webhook_url, {
-                reel_url: url,
-                caption: null,
-                job_id: job_id,
-                status: 'failed',
-                error: error.message,
-                profile_username: profile_username || username,
-                pipeline_id: pipeline_id,
-                timestamp: new Date().toISOString()
-            });
-        }
-        
-        res.status(500).json({
+        return res.status(500).json({
             success: false,
             error: 'Internal server error',
             message: error.message
@@ -327,7 +377,6 @@ app.post('/api/caption', async (req, res) => {
 /**
  * Process multiple URLs
  * POST /api/caption/batch
- * Body: { "urls": ["url1", "url2", ...] }
  */
 app.post('/api/caption/batch', async (req, res) => {
     const { urls } = req.body;
@@ -366,7 +415,6 @@ app.post('/api/caption/batch', async (req, res) => {
             console.log(`📝 Scraping ${urlsToScrape.length} URLs...`);
             const scrapedResults = await processBatch(urlsToScrape);
             
-            // Store scraped results in database
             for (const result of scrapedResults) {
                 if (result.success && result.caption) {
                     await storeCaption(result.url, result.caption);
@@ -397,7 +445,7 @@ app.post('/api/caption/batch', async (req, res) => {
 
 /**
  * Get caption from Instagram URL via oEmbed (direct method)
- * GET /api/caption?url=https://www.instagram.com/...
+ * GET /api/caption?url=...
  */
 app.get('/api/caption', async (req, res) => {
     const { url } = req.query;
@@ -410,7 +458,6 @@ app.get('/api/caption', async (req, res) => {
     }
     
     try {
-        // Check database first
         const dbResult = await getCaptionFromDB(url);
         
         if (dbResult && dbResult.caption) {
@@ -424,13 +471,12 @@ app.get('/api/caption', async (req, res) => {
             });
         }
         
-        // Try oEmbed first as a faster alternative
+        // Try oEmbed first
         const axios = require('axios');
         const oembedUrl = `https://api.instagram.com/oembed?url=${encodeURIComponent(url)}`;
         const response = await axios.get(oembedUrl, { timeout: 10000 });
         
         if (response.data && response.data.title) {
-            // Store in database
             await storeCaption(url, response.data.title);
             
             res.json({
@@ -442,7 +488,6 @@ app.get('/api/caption', async (req, res) => {
                 timestamp: new Date().toISOString()
             });
         } else {
-            // Fallback to copytext automation
             const result = await getCaptionFromCopytext(url);
             
             if (result.success) {
@@ -451,7 +496,6 @@ app.get('/api/caption', async (req, res) => {
             res.json(result);
         }
     } catch (error) {
-        // Fallback to copytext automation
         try {
             const result = await getCaptionFromCopytext(url);
             
@@ -617,4 +661,5 @@ app.listen(PORT, () => {
     console.log(`📡 API: GET /api/captions (view all stored captions)`);
     console.log(`📡 API: GET /api/captions/:username`);
     console.log(`💾 Database: ${process.env.DATABASE_URL ? 'Configured' : 'Not configured'}`);
+    console.log(`🔄 Deduplication: Enabled`);
 });
