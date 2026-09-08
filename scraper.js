@@ -12,7 +12,6 @@ const axios = require('axios');
 const COPYTEXT_URL = 'https://copytext.app';
 
 // ============== BROWSER POOL ==============
-// 🔥 Shared browser instance reused across requests
 
 let sharedBrowser = null;
 let browserRefCount = 0;
@@ -20,14 +19,12 @@ let browserLock = false;
 let pendingRequests = [];
 
 async function getBrowser() {
-    // If browser exists and is connected, use it
     if (sharedBrowser && sharedBrowser.isConnected()) {
         browserRefCount++;
         console.log(`🔄 Reusing browser (ref count: ${browserRefCount})`);
         return sharedBrowser;
     }
     
-    // If browser is being created, wait for it
     if (browserLock) {
         console.log('⏳ Waiting for browser to be created...');
         return new Promise((resolve) => {
@@ -48,7 +45,8 @@ async function getBrowser() {
                 '--disable-setuid-sandbox',
                 '--disable-dev-shm-usage',
                 '--disable-accelerated-2d-canvas',
-                '--disable-gpu'
+                '--disable-gpu',
+                '--disable-blink-features=AutomationControlled'
             ]
         };
         
@@ -61,7 +59,6 @@ async function getBrowser() {
         browserRefCount = 1;
         console.log('✅ Browser launched successfully (shared)');
         
-        // Resolve any pending requests
         for (const resolve of pendingRequests) {
             resolve(sharedBrowser);
         }
@@ -81,7 +78,6 @@ function releaseBrowser() {
     browserRefCount--;
     console.log(`🔽 Releasing browser (ref count: ${browserRefCount})`);
     
-    // Schedule browser close after 60 seconds of inactivity
     if (browserRefCount <= 0 && sharedBrowser) {
         console.log('⏳ Scheduling browser close in 60 seconds...');
         setTimeout(async () => {
@@ -95,7 +91,7 @@ function releaseBrowser() {
                     sharedBrowser = null;
                 }
             }
-        }, 60000); // Close after 60 seconds idle
+        }, 60000);
     }
 }
 
@@ -330,6 +326,17 @@ async function getCaptionFromCopytext(reelUrl) {
         
         console.log(`📊 Final caption length: ${caption ? caption.length : 0} characters`);
         
+        // ✅ If no caption found, return error
+        if (!caption || caption.length < 20) {
+            return {
+                caption: '',
+                success: false,
+                error: 'No caption found after all methods',
+                url: reelUrl,
+                method: 'copytext'
+            };
+        }
+        
         return {
             caption: caption || '',
             success: caption && caption.length > 20,
@@ -368,7 +375,6 @@ async function processBatch(urls, concurrency = 3) {
     
     console.log(`📋 Processing ${urls.length} URLs with concurrency ${concurrency}`);
     
-    // Process in chunks
     for (let i = 0; i < urls.length; i += chunkSize) {
         const chunk = urls.slice(i, i + chunkSize);
         const chunkNum = Math.floor(i / chunkSize) + 1;
@@ -376,7 +382,6 @@ async function processBatch(urls, concurrency = 3) {
         
         console.log(`\n📦 Chunk ${chunkNum}/${totalChunks}: ${chunk.length} URLs`);
         
-        // Process chunk in parallel
         const chunkResults = await Promise.all(
             chunk.map(async (url) => {
                 const trimmedUrl = url.trim();
@@ -393,12 +398,10 @@ async function processBatch(urls, concurrency = 3) {
             })
         );
         
-        // Add results from this chunk
         for (const result of chunkResults) {
             if (result) results.push(result);
         }
         
-        // Wait between chunks
         if (i + chunkSize < urls.length) {
             console.log('⏳ Waiting 2 seconds before next chunk...');
             await new Promise(resolve => setTimeout(resolve, 2000));
